@@ -1,0 +1,1456 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace Backtester_v7
+{
+    internal class Program
+    {
+        /*
+         * 
+        
+        Author:                Russell Brown
+        Programming Language:  C#
+        Date:                  Nov 16 / 2025
+
+        TECHNICAL OVERVIEW:
+
+         
+        The backtesting engine in Backtester_v7 is built as a streaming bar-based simulation system that processes historical OHLCV data sequentially and reconstructs a 
+        realistic trading environment. It specifically supports and evaluates a martingale-style grid strategy, whose foundation is the assumption that extreme deviations 
+        from the mean tend to revert—allowing progressively larger positions to recover losses and capture profit when the price snaps back. Incoming one-minute candles 
+        are aggregated into higher-timeframe bars using a strict time-boundary algorithm; once a bar completes, the system shifts its fixed-length window and recalculates 
+        EMA-based Bollinger bands. These bands identify statistically stretched conditions: a break above the upper band triggers a short bias, and a break below the 
+        lower band triggers a long bias. When price moves adversely, the backtester simulates increasing position sizes—multiplying each new scale-in trade by a 
+        configurable factor—to test whether the martingale mechanism ultimately reaches its profit target or collapses under runaway trends. This structure explicitly 
+        exposes the grid system to realistic serial price movement, slippage-free but bar-accurate fills, and natural drawdowns inherent in martingale behavior.
+
+        During each bar, the backtester marks all open positions to market, computing the basket-level unrealized profit and updating running equity, peak equity, 
+        and real-time drawdown. Once the basket’s combined profit reaches a predefined target, the system closes all trades simultaneously, realizes P&L, and resets 
+        equity peaks before continuing to the next cycle. Throughout the simulation, the engine also tracks monthly profit, longest trade duration, win/loss 
+        distribution, and other performance statistics. After the dataset is fully processed, the backtester reconstructs a full synthetic equity curve to compute 
+        maximum drawdown, calculates the strategy’s CAGR, compares it to a buy-and-hold benchmark, and derives alpha. The result is an institutional-level statistical 
+        breakdown of the strategy’s behavior across the entire test period, including volatility of monthly returns and risk-adjusted performance characteristics.
+
+        The optimization subsystem is integrated directly into the backtester by repeatedly invoking run_backtest() across large parameter grids. In optimization 
+        mode, the engine suppresses full reporting and instead prints compact single-line summaries for each parameter set, including ending balance, CAGR, drawdown, 
+        monthly statistics, trade count, win rate, and total PnL. To improve efficiency, the system contains a hard drawdown stop: if any configuration experiences 
+        more than –4000 units of equity drawdown, the simulation aborts immediately and marks the setup as failed. This prevents unnecessary compute cycles on weak 
+        parameter combinations and dramatically speeds up brute-force exploration of multi-dimensional spaces such as spacing, multiplier, profit target, and Bollinger 
+        settings. The combined design enables rapid identification of robust martingale configurations and clarifies which parameter regions exhibit resilience or 
+        catastrophic behavior under historical conditions.
+
+        Starting with a balance of $10,000, the strategy grew the account to $24,270.15, producing a total profit of $14,270.15 over 2.85 years of EUR/USD historical data. 
+        This corresponds to a CAGR of 36.53%, dramatically outperforming the benchmark’s 2.83% CAGR and generating an annualized alpha of 33.69%. The average monthly profit 
+        was $408, with moderate volatility of $355 per month. Despite utilizing a martingale-style system, the strategy maintained a relatively contained maximum drawdown 
+        of –$1,884, representing only 18.8% of initial capital. Overall, the system delivered strong compounded growth, high risk-adjusted performance, and consistent 
+        profitability over the tested period.
+
+        References:
+
+        Historical data sourced from https://www.backtestmarket.com (Nov 16 / 2025)
+        Annotated by ChatGPT
+
+
+         */
+
+        class EMA
+        {
+            // Output array containing the EMA values (one per data point)
+            public double[] values;
+
+            // Default EMA period
+            public int period = 8;
+
+            // Constructor allows custom period
+            public EMA(int period)
+            {
+                this.period = period;
+            }
+
+            // Compute EMA over the given data array
+            public void Calculate(double[] data)
+            {
+                int len = data.Length;
+
+                // If no data → return empty structure
+                if (len == 0)
+                {
+                    values = new double[0];
+                    return;
+                }
+
+                // Allocate output buffer
+                values = new double[len];
+
+                // If less data than period, the EMA cannot calculate properly.
+                // values[] stays allocated but empty (zeros)
+                if (len < period)
+                {
+                    // No calculation possible — early exit.
+                    return;
+                }
+
+                // Standard EMA multiplier α = 2/(N+1)
+                double multiplier = 2.0 / (period + 1);
+
+                // --- 1. Compute initial SMA (simple moving average) seed ---
+                // This seeds EMA[period-1] with the SMA of the first N prices.
+                double sum = 0.0;
+                int i;
+                for (i = 0; i < period; i++)
+                    sum += data[i];
+
+                // Simple moving average for seeding the EMA
+                double sma = sum / period;
+                values[period - 1] = sma;
+
+                // --- 2. Fill earlier values (indices < period-1)
+                // These positions do not have a real EMA yet.
+                // The code copies raw data into them.
+                // (Some implementations would use NaN instead.)
+                for (i = 0; i < period - 1; i++)
+                    values[i] = data[i];
+
+                // --- 3. Standard EMA recursive formula ---
+                // EMA[i] = EMA[i-1] + α * (Price[i] - EMA[i-1])
+                for (i = period; i < len; i++)
+                {
+                    double prev = values[i - 1];                     // EMA[i-1]
+                    double ema = (data[i] - prev) * multiplier + prev; // EMA recursion
+                    values[i] = ema;
+                }
+            }
+        }
+
+
+
+        class EMABollinger
+        {
+            // Upper Bollinger band for each index
+            public double[] upper;
+
+            // Middle band = EMA(period)
+            public double[] middle;
+
+            // Lower Bollinger band for each index
+            public double[] lower;
+
+            // EMA period for middle band
+            public int period = 21;
+
+            // How many standard deviations from EMA (usually 2.0, here 1.3)
+            public double deviation = 1.3;
+
+            // Compute EMA + Bollinger bands over the input data
+            public void Calculate(double[] data)
+            {
+                int len = data.Length;
+
+                // Handle empty data input
+                if (len == 0)
+                {
+                    upper = new double[0];
+                    middle = new double[0];
+                    lower = new double[0];
+                    return;
+                }
+
+                // --- 1. Middle band = EMA(period) ---
+                EMA ema = new EMA(period);
+                ema.Calculate(data);
+                middle = ema.values;   // middle[] is the EMA output
+
+                // Allocate final band arrays
+                upper = new double[len];
+                lower = new double[len];
+
+                // If not enough data to do full Bollinger math,
+                // fall back to raw input values (degenerate bands)
+                if (len < period)
+                {
+                    for (int i2 = 0; i2 < len; i2++)
+                    {
+                        // These bands will sit on the price itself
+                        upper[i2] = data[i2];
+                        lower[i2] = data[i2];
+                    }
+                    return;
+                }
+
+                // --- 2. Compute rolling standard deviation relative to EMA ---
+                // This stdev[] is local scratch array used to compute band width.
+                double[] stdev = new double[len];
+                int i, j;
+
+                // For the early region (< period-1),
+                // no full window can exist → initialize simply.
+                for (i = 0; i < period - 1; i++)
+                {
+                    stdev[i] = 0.0;    // placeholder
+                    upper[i] = data[i];
+                    lower[i] = data[i];
+                }
+
+                // Standard deviation over last N values, for each complete window
+                for (i = period - 1; i < len; i++)
+                {
+                    // Middle band value at current index (EMA)
+                    double m = middle[i];
+
+                    // Compute variance across last N (period) prices
+                    double sum = 0.0;
+
+                    // j walks the window [i - period + 1 .. i]
+                    for (j = i - period + 1; j <= i; j++)
+                    {
+                        double diff = data[j] - m;
+                        sum += diff * diff;   // squared difference
+                    }
+
+                    // Variance and standard deviation
+                    double variance = sum / period;
+                    double sd = Math.Sqrt(variance);
+                    stdev[i] = sd;
+
+                    // --- 3. Upper and lower bands ---
+                    // Standard Bollinger: Upper = EMA + k*SD, Lower = EMA - k*SD
+                    upper[i] = m + deviation * sd;
+                    lower[i] = m - deviation * sd;
+                }
+            }
+        }
+
+
+        // Chart, replicates a trading chart window
+        // Maintains a sliding window of bars (OHLCV) and updates indicators when a new bar forms.
+        class Chart
+        {
+            // Total number of bars stored in the chart window
+            public int length = 100;
+
+            // Arrays holding OHLCV data for each bar in the window.
+            // Index 0 = oldest bar, index length-1 = newest bar.
+            public DateTime[] date;
+            public double[] open;
+            public double[] high;
+            public double[] low;
+            public double[] close;
+            public double[] volume;
+
+            // The timestamp at which the next bar should begin
+            public DateTime next_period;
+
+            // Number of bars that have been filled so far (0 → first bar, … up to length-1)
+            public int barid;
+
+            // True only at the moment when a full new bar has been completed and indicators must update
+            public bool new_period;
+
+            // A list of indicator objects (generic object list to support multiple types of indicators)
+            public List<object> indicators;
+
+            // The chart timeframe in minutes (e.g., 15-minute bars)
+            public int period = 15;
+
+            // Constructor initializes arrays, state, and the Bollinger indicator
+            public Chart(int bollinger_period, double bollinger_deviation)
+            {
+                // Allocate arrays of fixed size (fixed window)
+                date = new DateTime[length];
+                open = new double[length];
+                high = new double[length];
+                low = new double[length];
+                close = new double[length];
+                volume = new double[length];
+
+                // barid = 0 means only last bar used so far
+                barid = 0;
+
+                // No new bar yet
+                new_period = false;
+
+                // Prepare list of indicators
+                indicators = new List<object>();
+
+                // Create Bollinger indicator (EMA-based)
+                EMABollinger bollinger = new EMABollinger();
+                bollinger.period = bollinger_period;
+                bollinger.deviation = bollinger_deviation;
+
+                // Add it to the indicator list
+                indicators.Add(bollinger);
+            }
+
+            // Update the chart with a new tick (timestamp + OHLCV tick data)
+            public void Update(DateTime t, double o, double h, double l, double c, int v)
+            {
+                // Reset flag at beginning of update
+                new_period = false;
+
+                // Index of most recent bar in arrays
+                int last = length - 1;
+
+                // FIRST UPDATE CALL: next_period is zero (DateTime default)
+                // So the chart must initialize its first bar.
+                if (next_period.Ticks == 0)
+                {
+                    // Populate the last position with the first incoming data point
+                    date[last] = t;
+                    open[last] = o;
+                    high[last] = h;
+                    low[last] = l;
+                    close[last] = c;
+                    volume[last] = v;
+
+                    // Determine the next boundary for the chart period
+                    next_period = t;
+                    while (true)
+                    {
+                        // Step forward one period at a time until next_period is AFTER t
+                        next_period = next_period.AddMinutes(period);
+                        if (next_period > t) break;
+                    }
+                    return;  // First initialization complete
+                }
+
+                // NORMAL OPERATION: Check whether the incoming tick timestamp
+                // has passed the next bar boundary.
+                // If so → a new bar must be created.
+                if (t >= next_period)
+                {
+                    // SHIFT THE ENTIRE WINDOW LEFT BY 1 BAR.
+                    // This discards the oldest bar (index 0) and moves every bar up.
+                    for (int k = 0; k < length - 1; k++)
+                    {
+                        date[k] = date[k + 1];
+                        open[k] = open[k + 1];
+                        high[k] = high[k + 1];
+                        low[k] = low[k + 1];
+                        close[k] = close[k + 1];
+                        volume[k] = volume[k + 1];
+                    }
+
+                    // Construct the new closing bar at the end of the window
+                    date[last] = t;
+                    open[last] = o;
+                    high[last] = h;
+                    low[last] = l;
+                    close[last] = c;
+                    volume[last] = v;
+
+                    // Move next_period forward until it exceeds the current tick time.
+                    // Handles cases where multiple periods may have passed.
+                    while (true)
+                    {
+                        next_period = next_period.AddMinutes(period);
+                        if (next_period > t) break;
+                    }
+
+                    // barid counts how many bars have been filled.
+                    // On first few bars, this increments until the chart is filled.
+                    if (barid < length - 1)
+                    {
+                        barid++;
+                    }
+
+                    // If barid == length-1 → the chart is FULL,
+                    // meaning every array slot contains a valid bar.
+                    if (barid == length - 1)
+                    {
+                        // A full bar has just closed; trigger calculations
+                        new_period = true;
+
+                        // Update every indicator in the list
+                        foreach (object ind in indicators)
+                        {
+                            // If indicator is a classic EMA
+                            if (ind is EMA)
+                            {
+                                EMA i = (EMA)ind;
+                                // Feed the OPEN prices array into the indicator
+                                i.Calculate(open);
+                            }
+                            // If indicator is an EMA-based Bollinger band
+                            else if (ind is EMABollinger)
+                            {
+                                EMABollinger i = (EMABollinger)ind;
+                                i.Calculate(open);
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    // STILL WITHIN THE CURRENT BAR:
+                    // Update the OHLCV of the existing last bar.
+
+                    // Update high if the incoming tick is higher
+                    if (h > high[last]) high[last] = h;
+
+                    // Update low if incoming tick is lower
+                    if (l < low[last]) low[last] = l;
+
+                    // Always update close to most recent tick
+                    close[last] = c;
+
+                    // Accumulate volume
+                    volume[last] += v;
+                }
+            }
+        }
+        class Trade
+        {
+            // Direction of the trade (buy = Long, sell = Short)
+            public enum Direction { Long, Short }
+
+            // Trade status: active or closed
+            public enum Status { Opened, Closed }
+
+            // Unique identifier for this trade
+            public int trade_id;
+
+            // Whether the trade is currently open or closed
+            public Status status;
+
+            // Trade direction (Long = buy to open, Short = sell to open)
+            public Direction direction;
+
+            // Number of contracts / lots
+            public double quantity;
+
+            // The monetary value per point/pip/tick (e.g., $1 per point)
+            public double contract_size;
+
+            // Timestamp at which the trade was opened
+            public DateTime entry_date;
+
+            // Price at which the trade was opened
+            public double entry_price;
+
+            // Timestamp when the trade was closed (valid only if status = Closed)
+            public DateTime exit_date;
+
+            // Exit price of the trade (valid only if status = Closed)
+            public double exit_price;
+
+            // Net price movement (exit - entry for long, entry - exit for short)
+            public double points;
+
+            // Total realized or unrealized P/L = points * quantity * contract_size
+            public double profit;
+
+            // Constructor: initializes an OPEN trade with provided parameters
+            public Trade(int id, Direction dir, double qty, double csize, DateTime dt, double price)
+            {
+                trade_id = id;                        // assign ID
+                status = Status.Opened;               // newly created trades are open
+                direction = dir;                      // long or short
+                quantity = qty;                       // lot size
+                contract_size = csize;                // value of each price point
+                entry_date = dt;                      // entry timestamp
+                entry_price = price;                  // entry price
+            }
+
+            // Update unrealized profit using a live price
+            public void UpdateProfit(double current_price)
+            {
+                // For a long: profit = (current - entry)
+                // For a short: profit = (entry - current)
+                points = (direction == Direction.Long) ? current_price - entry_price
+                                                       : entry_price - current_price;
+
+                // Dollar value of the movement
+                profit = points * quantity * contract_size;
+            }
+
+            // Finalize the trade, stamping exit time and price
+            public void Close(DateTime dt, double price)
+            {
+                exit_date = dt;          // store closing timestamp
+                exit_price = price;      // store final close price
+
+                // Compute final point gain/loss
+                points = (direction == Direction.Long) ? exit_price - entry_price
+                                                       : entry_price - exit_price;
+
+                // Final realized profit
+                profit = points * quantity * contract_size;
+
+                // Mark trade as closed
+                status = Status.Closed;
+            }
+
+            // Convenience helpers
+            public bool IsOpen() { return status == Status.Opened; }
+            public bool IsClosed() { return status == Status.Closed; }
+        }
+
+
+
+        // Reads through a large text file (already loaded into memory as `data`)
+        // Each line begins with a date in format "dd/MM/yyyy"
+        // Goal:
+        //   - Find first line >= target date
+        //   - Return:
+        //         lineNumber = index of first matching line
+        //         offset     = byte position where that line starts
+        //         rows       = how many lines satisfy the condition (>= target)
+        static (int lineNumber, long offset, int rows) CountFromDate(byte[] data, DateTime target)
+        {
+            int firstLine = -1;  // index of first line meeting condition
+            int line = 0;        // current line number while scanning
+            int rows = 0;        // count of lines meeting condition
+            long offset = -1;    // byte offset of first matching line
+
+            // Scan entire buffer line by line
+            for (int i = 0; i < data.Length;)
+            {
+                // Locate end-of-line by searching for '\n'
+                int end = Array.IndexOf<byte>(data, (byte)'\n', i);
+                if (end < 0) end = data.Length;  // last line may not terminate with newline
+
+                // Extract only first 10 bytes = "dd/MM/yyyy"
+                string sDate = Encoding.UTF8.GetString(data, i, 10);
+
+                // Parse the date from fixed-format string
+                DateTime d = DateTime.ParseExact(sDate, "dd/MM/yyyy", null);
+
+                // Check if line's date >= requested target date
+                if (d >= target)
+                {
+                    // If first match not yet found, record this line
+                    if (firstLine < 0)
+                    {
+                        firstLine = line;
+                        offset = i;  // byte index where line begins
+                    }
+
+                    // Count this line as valid
+                    rows++;
+                }
+
+                // Advance to next line
+                line++;
+                i = end + 1;
+            }
+
+            // Return tuple of: first line index, its offset, and total count
+            return (firstLine, offset, rows);
+        }
+
+
+
+        // Classic binary-search lower-bound for DateTime[] arrays
+        // Finds the earliest index where arr[index] >= dt.
+        //
+        // If dt is greater than all elements, returns last valid index.
+        //
+        // Uses standard binary search tightening between lo and hi.
+        static int FindIndex(DateTime[] arr, int len, DateTime dt)
+        {
+            int lo = 0;
+            int hi = len - 1;
+            int mid;
+
+            // Standard binary search loop
+            while (lo <= hi)
+            {
+                mid = (lo + hi) >> 1;  // divide by 2 efficiently
+
+                // If mid value is less than target, discard left half
+                if (arr[mid] < dt)
+                    lo = mid + 1;
+                else
+                    // Otherwise, potential answer — tighten upper bound
+                    hi = mid - 1;
+            }
+
+            // lo is now the first index where arr[lo] >= dt
+            // but if dt is too large, clamp to last index
+            return lo < len ? lo : len - 1;
+        }
+
+
+        static void run_backtest(
+            bool optimizing,
+                int rows,
+                DateTime[] dtArr,
+                double[] openArr,
+                double[] highArr,
+                double[] lowArr,
+                double[] closeArr,
+                int[] volArr, object[] inputs)
+        {
+
+            // Only print this message when NOT optimizing.
+            // Optimization mode prints compact stats only.
+            if (optimizing == false)
+                Console.WriteLine("backtesting data...");
+
+
+            // Create a chart object using Bollinger params:
+            // inputs[4] = Bollinger period (int)
+            // inputs[5] = Bollinger deviation (double)
+            Chart chart = new Chart((int)inputs[4], (double)inputs[5]);
+
+            // Force chart to initialize on first tick update.
+            // next_period == 0 → chart treats first update as initial bar.
+            chart.next_period = new DateTime(0);
+
+
+            // List of trades that have been fully closed.
+            List<Trade> closedTrades = new List<Trade>();
+
+            // List of trades currently open (unrealized).
+            List<Trade> openedTrades = new List<Trade>();
+
+
+            // Previous bar close price (needed for Bollinger band cross signals)
+            double prevPrice = 0;
+
+            // Sequential trade ID counter (each new trade gets unique ID)
+            int signalCount = 0;
+
+
+            // ---------------------- Strategy Parameters ----------------------
+
+            // Base size of first position when a trade signal occurs
+            double initialQty = (double)inputs[0];
+
+            // Grid spacing between scale-in trades
+            double spacing = (double)inputs[1];
+
+            // Multiplier used for martingale-type scale-ins (qty *= multiplier)
+            double multiplier = (double)inputs[2];
+
+            // Profit target at which ALL open trades are closed
+            double target_profit = (double)inputs[3];
+
+
+            // ---------------------- Account & Equity Tracking ----------------------
+
+            // Starting capital for the backtest
+            double startingBalance = 10000;
+
+            // Realized balance (only closed trades affect this)
+            double summaryBalance = startingBalance;
+
+            // Total account equity INCLUDING open trades
+            double summaryEquity = summaryBalance;
+
+            // Highest recorded equity value (used for drawdown calculation)
+            double equityPeak = summaryEquity;
+
+            // Real-time drawdown = equity - peak (negative number)
+            double realtimeDD = 0.0;
+
+
+            // Status message for optimization mode ("passed" or "failed")
+            string comment = "passed";
+
+
+            // ---------------------- Monthly PnL Aggregation ----------------------
+
+            // Dictionary keyed by "YYYY-MM", value = monthly profit
+            Dictionary<string, double> monthProfit = new Dictionary<string, double>();
+
+            // Keeps equity snapshot at beginning of current month
+            double lastMonthEquity = summaryEquity;
+
+            // Tracks current month label ("YYYY-MM"), empty until first bar
+            string currentMonth = "";
+
+
+            // ---------------------- Position Size & Instrument Settings ----------------------
+
+            // Maximum allowable TOTAL open quantity across all trades
+            double maxOpenQty = 5;
+
+            // Contract size of instrument (e.g., Forex 100,000 per lot)
+            double contractSize = 100000;
+
+
+
+            for (int i = 0; i < rows; i++)
+            {
+                // Push the next tick/candle data into the chart.
+                // The chart will internally detect when a full bar closes.
+                chart.Update(dtArr[i], openArr[i], highArr[i], lowArr[i], closeArr[i], volArr[i]);
+
+                // Only act when the chart has accumulated enough bars to fill the window.
+                // barid == length-1 means the sliding window is fully populated.
+                if (chart.barid == chart.length - 1)
+                {
+                    int last = chart.length - 1;        // Index of newest bar in the window
+                    DateTime t = chart.date[last];      // Timestamp of newest bar
+                    double price = chart.close[last];   // Closing price of newest bar
+
+                    // Retrieve pre-initialized Bollinger indicator (EMA-based)
+                    EMABollinger bb = (EMABollinger)chart.indicators[0];
+
+                    // Latest Bollinger values for current bar
+                    double up = bb.upper[last];         // Upper band
+                    double mid = bb.middle[last];       // Middle EMA band
+                    double low = bb.lower[last];        // Lower band
+
+                    // ----------------------------------------------------
+                    // Count currently open LONG trades
+                    // ----------------------------------------------------
+                    int openLongs = 0;
+                    foreach (Trade tr in openedTrades)
+                    {
+                        if (tr.IsOpen() && tr.direction == Trade.Direction.Long)
+                            openLongs++;
+                    }
+
+                    // ----------------------------------------------------
+                    // Count currently open SHORT trades
+                    // ----------------------------------------------------
+                    int openShorts = 0;
+                    foreach (Trade tr in openedTrades)
+                    {
+                        if (tr.IsOpen() && tr.direction == Trade.Direction.Short)
+                            openShorts++;
+                    }
+
+                    // Detect crosses against Bollinger bands.
+                    // Cross ABOVE upper band → short signal
+                    bool crossUp = (prevPrice <= up && price > up);     // SHORT signal
+
+                    // Cross BELOW lower band → long signal
+                    bool crossDown = (prevPrice >= low && price < low); // LONG signal
+
+                    // Sum total open quantity across all active trades (used for maxOpenQty control)
+                    double totalQty = 0;
+                    foreach (Trade tr in openedTrades)
+                        if (tr.IsOpen())
+                            totalQty += tr.quantity;
+
+                    // Allow new entry only if below max position size
+                    bool allowNewEntry = false;
+
+                    if (totalQty < maxOpenQty)
+                        allowNewEntry = true;
+
+                    // ----------------------------------------------------
+                    // ENTRY LOGIC (Long and Short)
+                    // Runs only when allowNewEntry == true
+                    // ----------------------------------------------------
+                    if (allowNewEntry)
+                    {
+
+                        //---------------------------------------------------------
+                        // SHORT ENTRY LOGIC
+                        //---------------------------------------------------------
+
+                        if (openShorts == 0)
+                        {
+                            // No shorts open → initial short entry only
+                            if (crossUp)
+                            {
+                                // Enter first short position
+                                openedTrades.Add(new Trade(
+                                    signalCount++,               // unique ID
+                                    Trade.Direction.Short,       // direction
+                                    initialQty,                  // quantity
+                                    contractSize,                // contract value
+                                    t,                           // entry time
+                                    price                        // entry price
+                                ));
+                            }
+                        }
+                        else
+                        {
+                            // Find most recent open short (scaling anchor)
+                            Trade lastOpenShort = null;
+
+                            for (int i2 = 0; i2 < openedTrades.Count; i2++)
+                            {
+                                Trade tr = openedTrades[i2];
+
+                                if (tr.IsOpen() && tr.direction == Trade.Direction.Short)
+                                {
+                                    // The most recently opened short (largest timestamp wins)
+                                    if (lastOpenShort == null || tr.entry_date > lastOpenShort.entry_date)
+                                    {
+                                        lastOpenShort = tr;
+                                    }
+                                }
+                            }
+
+                            // If price has risen above last short's entry by spacing → scale in
+                            if (lastOpenShort != null &&
+                                price > lastOpenShort.entry_price + spacing)
+                            {
+                                openedTrades.Add(new Trade(
+                                    signalCount++,
+                                    Trade.Direction.Short,
+                                    lastOpenShort.quantity * multiplier,   // scale-in size
+                                    contractSize,
+                                    t,
+                                    price
+                                ));
+                            }
+                        }
+
+                        //---------------------------------------------------------
+                        // LONG ENTRY LOGIC
+                        //---------------------------------------------------------
+
+                        if (openLongs == 0)
+                        {
+                            // No longs open → initial long entry only
+                            if (crossDown)
+                            {
+                                openedTrades.Add(new Trade(
+                                    signalCount++,
+                                    Trade.Direction.Long,
+                                    initialQty,
+                                    contractSize,
+                                    t,
+                                    price
+                                ));
+                            }
+                        }
+                        else
+                        {
+                            // Find most recent long for scale-in anchor
+                            Trade lastOpenLong = null;
+
+                            for (int i2 = 0; i2 < openedTrades.Count; i2++)
+                            {
+                                Trade tr = openedTrades[i2];
+
+                                if (tr.IsOpen() && tr.direction == Trade.Direction.Long)
+                                {
+                                    if (lastOpenLong == null || tr.entry_date > lastOpenLong.entry_date)
+                                    {
+                                        lastOpenLong = tr;
+                                    }
+                                }
+                            }
+
+                            // If price has dropped below last long's entry by spacing → scale in
+                            if (lastOpenLong != null &&
+                                price < lastOpenLong.entry_price - spacing)
+                            {
+                                openedTrades.Add(new Trade(
+                                    signalCount++,
+                                    Trade.Direction.Long,
+                                    lastOpenLong.quantity * multiplier,     // pyramiding logic
+                                    contractSize,
+                                    t,
+                                    price
+                                ));
+                            }
+                        }
+
+                    }
+
+
+
+                    // ------------------------------------------------------
+                    // UPDATE UNREALIZED P/L FOR OPEN TRADES
+                    // ------------------------------------------------------
+                    double totalProfit = 0.0;
+                    DateTime lastEntryDate = new DateTime(0);
+
+                    foreach (Trade tr in openedTrades)
+                    {
+                        if (tr.IsOpen())
+                        {
+                            tr.UpdateProfit(price);       // update unrealized profit
+                            totalProfit += tr.profit;     // accumulate
+                            lastEntryDate = tr.entry_date;
+                        }
+                    }
+
+                    // Unrealized equity = balance + open P/L
+                    summaryEquity = summaryBalance + totalProfit;
+
+                    // Update equity peak
+                    if (summaryEquity > equityPeak)
+                        equityPeak = summaryEquity;
+
+                    // Drawdown = current equity - peak equity (negative number)
+                    realtimeDD = summaryEquity - equityPeak;
+
+
+                    // Convert timestamp to "yyyy-MM" for monthly PnL grouping
+                    string ym = t.ToString("yyyy-MM");   // e.g. "2023-07"
+
+                    // Initialize first month
+                    if (currentMonth == "")
+                    {
+                        currentMonth = ym;
+                        lastMonthEquity = summaryEquity;
+                    }
+
+                    // Detect month rollover
+                    if (ym != currentMonth)
+                    {
+                        // Profit difference for the completed month
+                        double diff = summaryEquity - lastMonthEquity;
+
+                        // Accumulate monthly profit for prior month
+                        if (!monthProfit.ContainsKey(currentMonth))
+                            monthProfit[currentMonth] = 0;
+
+                        monthProfit[currentMonth] += diff;
+
+                        // Reset month tracking
+                        currentMonth = ym;
+                        lastMonthEquity = summaryEquity;
+
+                        // Month difference from start of dataset (not used for anything else)
+                        int monthDiff =
+                            (t.Year - dtArr[0].Year) * 12 +
+                            (t.Month - dtArr[0].Month);
+                    }
+
+
+                    // ------------------------------------------------------
+                    // EXIT LOGIC — close all trades when target profit met
+                    // ------------------------------------------------------
+
+                    // Ensure profit target is met AND at least one bar has passed since last entry
+                    if (totalProfit >= target_profit && t > lastEntryDate)
+                    {
+                        // Close each open trade at current price
+                        foreach (Trade tr in openedTrades)
+                        {
+                            tr.Close(t, price);
+                            closedTrades.Add(tr);
+                        }
+
+                        // Remove all open positions
+                        openedTrades.Clear();
+
+                        // Realize P/L into balance
+                        summaryBalance += totalProfit;
+
+                        // Reset equity/peak after closing
+                        summaryEquity = summaryBalance;
+                        equityPeak = summaryEquity;
+
+                        totalProfit = 0;
+
+                        // ------------------------------------------------------
+                        // Re-evaluate month boundary after closing trades
+                        // ------------------------------------------------------
+                        string ym2 = t.ToString("yyyy-MM");
+
+                        if (ym2 != currentMonth)
+                        {
+                            double diff = summaryEquity - lastMonthEquity;
+
+                            if (!monthProfit.ContainsKey(currentMonth))
+                                monthProfit[currentMonth] = 0;
+
+                            monthProfit[currentMonth] += diff;
+
+                            currentMonth = ym2;
+                            lastMonthEquity = summaryEquity;
+                        }
+
+                    }
+
+
+                    // After all close/entry logic, recompute summary equity
+                    summaryEquity = summaryBalance + totalProfit;
+
+                    if (summaryEquity > equityPeak)
+                        equityPeak = summaryEquity;
+
+                    realtimeDD = summaryEquity - equityPeak;
+
+                    // Optimization check: fail early if drawdown exceeds threshold
+                    if (optimizing && realtimeDD < -4000)
+                    {
+                        comment = "failed";
+                        break;          // Stop backtest early
+                    }
+
+                    // Store previous price for cross detection
+                    prevPrice = price;
+
+                } // end: if chart.barid == chart.length - 1
+
+
+            } // end for(i)
+
+
+            // Total number of closed trades in the backtest
+            int count = closedTrades.Count;
+
+            // Initialize P&L and statistical accumulators
+            double startBalance = startingBalance, totalPnL = 0, sumWins = 0, sumLosses = 0;
+            int wins = 0, losses = 0, longTrades = 0, shortTrades = 0;
+
+            // Track extreme outcomes
+            double largestWin = double.NegativeInfinity,        // will be replaced by the max positive trade
+                   largestLoss = double.PositiveInfinity;       // will be replaced by the max negative trade
+
+            // Track longest time a trade stayed open
+            TimeSpan maxOpenTime = TimeSpan.Zero;
+
+            // Begin and end dates of the entire trading period
+            // If no trades → fallback to MinValue
+            DateTime beginDate = count > 0 ? closedTrades[0].entry_date : DateTime.MinValue;
+            DateTime endDate = count > 0 ? closedTrades[count - 1].exit_date : DateTime.MinValue;
+
+
+            // ------------------------------------------------------------
+            // PROCESS EACH CLOSED TRADE: accumulate stats
+            // ------------------------------------------------------------
+            for (int i = 0; i < count; i++)
+            {
+                Trade tr = closedTrades[i];
+
+                // Add trade's realized P&L to running total
+                totalPnL += tr.profit;
+
+                // Count how many long/short trades were taken
+                if (tr.direction == Trade.Direction.Long) longTrades++;
+                else shortTrades++;
+
+                // Win or loss classification
+                if (tr.profit > 0)
+                {
+                    wins++;                 // number of winning trades
+                    sumWins += tr.profit;   // sum of winning trade profits
+
+                    // Track largest win
+                    if (tr.profit > largestWin)
+                        largestWin = tr.profit;
+                }
+                else
+                {
+                    losses++;               // number of losing trades
+                    sumLosses += tr.profit; // sum of losing trade losses (negative)
+
+                    // Track largest loss (most negative)
+                    if (tr.profit < largestLoss)
+                        largestLoss = tr.profit;
+                }
+
+                // Compute time the trade was held: exit minus entry
+                TimeSpan ot = tr.exit_date - tr.entry_date;
+
+                // Track the maximum open time
+                if (ot > maxOpenTime)
+                    maxOpenTime = ot;
+            }
+
+
+            // Win rate = wins / total trades (percentage)
+            double winRate = count > 0 ? wins * 100.0 / count : 0.0;
+
+            // Average profit for winning trades
+            double avgWin = wins > 0 ? sumWins / wins : 0.0;
+
+            // Average loss for losing trades
+            double avgLoss = losses > 0 ? sumLosses / losses : 0.0;
+
+
+            // ------------------------------------------------------------
+            // CAGR (Compound Annual Growth Rate) calculations
+            // ------------------------------------------------------------
+
+            // Number of years between first and last trade
+            // If no trades existed, use 0 years
+            double years = beginDate != DateTime.MinValue
+                ? (endDate - beginDate).TotalDays / 365.0
+                : 0.0;
+
+            // Ending balance after all closed PnL
+            double endBalance = startBalance + totalPnL;
+
+            // CAGR = (Ending / Starting)^(1 / Years) - 1
+            double CAGR = years > 0
+                ? Math.Pow(endBalance / startBalance, 1.0 / years) - 1.0
+                : 0.0;
+
+
+            // ------------------------------------------------------------
+            // Benchmark CAGR (Buy & Hold of underlying instrument)
+            // ------------------------------------------------------------
+
+            // Price of underlying at begin date index
+            double benchStart = closeArr[FindIndex(dtArr, rows, beginDate)];
+
+            // Price at end date index
+            double benchEnd = closeArr[FindIndex(dtArr, rows, endDate)];
+
+            // Buy-and-hold benchmark CAGR
+            double benchmarkCAGR = years > 0
+                ? Math.Pow(benchEnd / benchStart, 1.0 / years) - 1.0
+                : 0.0;
+
+            // Alpha = strategy CAGR minus benchmark CAGR
+            double alpha = CAGR - benchmarkCAGR;
+
+
+            // ------------------------------------------------------------
+            // Compute MAX DRAWDOWN using synthetic equity curve
+            // ------------------------------------------------------------
+            double maxDD = 0.0;
+
+            if (count > 0)
+            {
+                // Will store the equity curve point-by-point for each day the trade was active
+                List<double> equity = new List<double>();
+
+                // Accumulates realized PnL as we move through trades
+                double runningEq = 0.0;
+
+                // Build the equity curve by replaying price changes between entry→exit of each trade
+                for (int t = 0; t < count; t++)
+                {
+                    Trade tr = closedTrades[t];
+
+                    // Map entry & exit timestamps to their array indices via binary search
+                    int entry = FindIndex(dtArr, rows, tr.entry_date);
+                    int exit = FindIndex(dtArr, rows, tr.exit_date);
+
+                    // For each bar that the trade was open...
+                    for (int i = entry; i <= exit; i++)
+                    {
+                        double p = closeArr[i];    // price at time i
+
+                        // Compute unrealized P&L at this bar
+                        double pts = tr.direction == Trade.Direction.Long
+                            ? p - tr.entry_price       // long = price - entry
+                            : tr.entry_price - p;      // short = entry - price
+
+                        // Add unrealized profit to curve
+                        equity.Add(runningEq + pts * tr.quantity * tr.contract_size);
+                    }
+
+                    // After trade closes, add realized PnL to the running baseline
+                    runningEq += tr.profit;
+
+                    // Add final value after close
+                    equity.Add(runningEq);
+                }
+
+                // Compute maximum drawdown: largest peak-to-trough drop
+                double peak = equity[0];
+
+                for (int i = 0; i < equity.Count; i++)
+                {
+                    if (equity[i] > peak)
+                        peak = equity[i];
+
+                    double dd = equity[i] - peak;   // drawdown (negative)
+
+                    if (dd < maxDD)
+                        maxDD = dd;                 // track lowest (most negative)
+                }
+            }
+
+
+            // ------------------------------------------------------------
+            // MONTHLY STATISTICS: average & standard deviation
+            // ------------------------------------------------------------
+            double avgMonthly = 0.0;
+            double stdMonthly = 0.0;
+            double varMonthly = 0.0;
+
+            int mcount = monthProfit.Count;   // number of completed months tracked
+
+            if (mcount > 0)
+            {
+                // Compute average monthly profit
+                double sum = 0.0;
+                foreach (var kv in monthProfit)
+                    sum += kv.Value;
+
+                avgMonthly = sum / mcount;
+
+                // Compute variance about the mean
+                double varSum = 0.0;
+                foreach (var kv in monthProfit)
+                {
+                    double diff = kv.Value - avgMonthly;
+                    varSum += diff * diff;
+                }
+
+                // Variance and standard deviation
+                varMonthly = varSum / mcount;
+                stdMonthly = Math.Sqrt(varMonthly);
+            }
+
+            // If NOT optimizing → print full detailed human-readable backtest report
+            if (optimizing == false)
+            {
+                // Blank line + section header
+                Console.WriteLine();
+                Console.WriteLine("========== TRADE STATISTICS ==========");
+
+                // Core performance metrics
+                Console.WriteLine("Start Balance : " + startBalance);
+                Console.WriteLine("End Balance : " + endBalance.ToString("F2"));
+                Console.WriteLine("CAGR : " + (CAGR * 100).ToString("0.00") + "%");                  // annualized growth rate
+                Console.WriteLine("Benchmark CAGR : " + (benchmarkCAGR * 100).ToString("0.00") + "%"); // buy-and-hold CAGR
+                Console.WriteLine("Alpha : " + (alpha * 100).ToString("0.00") + "%");                 // strategy outperformance
+
+                // Date range of test
+                Console.WriteLine("Begin Date : " + beginDate);
+                Console.WriteLine("End Date : " + endDate);
+                Console.WriteLine("Total Years : " + years.ToString("0.00"));
+
+                // Risk metrics
+                Console.WriteLine("Max Open Time : " + maxOpenTime);                                  // longest duration a trade remained open
+                Console.WriteLine("Max Drawdown : " + maxDD.ToString("F2"));                          // worst peak-to-trough drop in equity
+                Console.WriteLine("Avg Monthly Profit : " + avgMonthly.ToString("F2"));
+                Console.WriteLine("Std Monthly Profit : " + stdMonthly.ToString("F2"));               // monthly volatility
+
+                // Trade-level statistics
+                Console.WriteLine("Total Trades : " + count);
+                Console.WriteLine("Winning Trades : " + wins);
+                Console.WriteLine("Losing Trades : " + losses);
+                Console.WriteLine("Win Rate : " + winRate.ToString("0.0") + "%");
+                Console.WriteLine("Long Trades : " + longTrades);
+                Console.WriteLine("Short Trades : " + shortTrades);
+                Console.WriteLine("Largest Win : " + largestWin.ToString("F2"));
+                Console.WriteLine("Largest Loss : " + largestLoss.ToString("F2"));
+                Console.WriteLine("Average Win : " + avgWin.ToString("F2"));
+                Console.WriteLine("Average Loss : " + avgLoss.ToString("F2"));
+                Console.WriteLine("Total PnL : " + totalPnL.ToString("F2"));
+
+                // Begin trade-by-trade listing
+                Console.WriteLine();
+                Console.WriteLine("========== TRADE LIST ==========");
+
+                double running = 0.0; // running cumulative PnL
+
+                // Print each trade with cumulative profit to see the equity staircase
+                for (int i = 0; i < count; i++)
+                {
+                    Trade tr = closedTrades[i];
+                    running += tr.profit;  // update cumulative PnL
+
+                    // Print trade in compact format
+                    Console.WriteLine(
+                        tr.trade_id + " | " +        // unique ID
+                        tr.direction + " | " +       // Long/Short
+                        tr.entry_price + " | " +     // entry price
+                        tr.exit_price + " | " +      // exit price
+                        tr.profit.ToString("F2") + " | " +   // realized PnL
+                        running.ToString("F2")       // cumulative equity
+                    );
+                }
+
+                // End of trade list
+                Console.WriteLine("================================");
+                Console.WriteLine("Final Total PnL = " + running.ToString("F2"));
+                Console.WriteLine("================================");
+
+                // Begin monthly PnL report
+                Console.WriteLine();
+                Console.WriteLine("========== MONTH PNL ==========");
+                Console.WriteLine();
+                Console.WriteLine("Month | Profit");
+
+                // Print each YYYY-MM and its profit
+                foreach (var kv in monthProfit)
+                {
+                    Console.WriteLine(kv.Key + " | " + kv.Value.ToString("F2"));
+                }
+            }
+            else
+            {
+                // OPTIMIZATION MODE:
+                // Print compact single-line summary for parameter sweeps.
+
+                // If this parameter set passed drawdown threshold, show green.
+                if (comment == "passed")
+                    Console.ForegroundColor = ConsoleColor.Green;
+                else
+                    Console.ResetColor();
+
+                // Print compact summary showing:
+                // [parameters] | balances | CAGR | drawdown | monthly stats | trade stats | comment
+                Console.WriteLine(
+                    "[" +
+                    ((double)inputs[0]).ToString("0.00") + ", " +      // initialQty
+                    ((double)inputs[1]).ToString("0.0000") + ", " +    // spacing
+                    ((double)inputs[2]).ToString("0.00") + ", " +      // multiplier
+                    ((double)inputs[3]).ToString("0.00") + ", " +      // target_profit
+                    ((int)inputs[4]).ToString() + ", " +               // bperiod (EMA/Bollinger period)
+                    ((double)inputs[5]).ToString("0.00") + "] | " +    // bdev (Bollinger deviation)
+
+                    startBalance + " | " +                             // starting balance
+                    endBalance.ToString("F2") + " | " +                // ending balance
+                    (CAGR * 100).ToString("0.00") + "%" + " | " +      // strategy CAGR
+                    maxOpenTime + " | " +                              // longest open duration
+                    maxDD.ToString("F2") + " | " +                     // max drawdown
+                    avgMonthly.ToString("F2") + " | " +                // average monthly profit
+                    stdMonthly.ToString("F2") + " | " +                // monthly volatility
+                    count + " | " +                                    // number of trades
+                    wins + " | " +                                     // wins
+                    losses + " | " +                                   // losses
+                    winRate.ToString("0.0") + " | " +                  // win rate %
+                    totalPnL.ToString("F2") + " | " +                  // total profit
+                    comment                                              // "passed" or "failed"
+                );
+            }
+
+
+        }
+
+
+        static void Main(string[] args)
+        {
+
+            string path = @" ..... ";
+
+
+            Console.WriteLine("loading data...");
+            byte[] data = File.ReadAllBytes(path);
+
+
+            DateTime target = new DateTime(2023, 1, 1);
+
+
+            var result = CountFromDate(data, target); 
+           
+
+
+            int rows = result.rows;
+
+            // Allocate arrays
+            DateTime[] dtArr = new DateTime[rows];
+            double[] openArr = new double[rows];
+            double[] highArr = new double[rows];
+            double[] lowArr = new double[rows];
+            double[] closeArr = new double[rows];
+            int[] volArr = new int[rows];
+
+            int idx = 0;
+
+            Console.WriteLine("reading data...");
+            using (MemoryStream ms = new MemoryStream(data))
+            {
+                ms.Position = result.offset;
+
+                using (StreamReader sr = new StreamReader(ms))
+                {
+                    string line;
+                    while ((line = sr.ReadLine()) != null)
+                    {
+                        int a = line.IndexOf(';');
+                        int b = line.IndexOf(';', a + 1);
+                        int c = line.IndexOf(';', b + 1);
+                        int d = line.IndexOf(';', c + 1);
+                        int e = line.IndexOf(';', d + 1);
+                        int f = line.IndexOf(';', e + 1);
+
+                        string sDate = line.Substring(0, a);
+                        string sTime = line.Substring(a + 1, b - a - 1);
+
+                        string[] formats = {
+                            "dd/MM/yyyy HH:mm:ss",
+                            "dd/MM/yyyy HH:mm"       
+                        };
+
+                        dtArr[idx] = DateTime.ParseExact(
+                            $"{sDate} {sTime}",
+                            formats,
+                            System.Globalization.CultureInfo.InvariantCulture,
+                            System.Globalization.DateTimeStyles.None
+                        );
+
+                        openArr[idx] = double.Parse(line.Substring(b + 1, c - b - 1));
+                        highArr[idx] = double.Parse(line.Substring(c + 1, d - c - 1));
+                        lowArr[idx] = double.Parse(line.Substring(d + 1, e - d - 1));
+                        closeArr[idx] = double.Parse(line.Substring(e + 1, f - e - 1));
+                        volArr[idx] = int.Parse(line.Substring(f + 1));
+
+                        idx++;
+                    }
+
+
+
+                }
+            }
+
+            double initialQty = 0.05;
+            double spacing = 0.0070;
+            double multiplier = 2;
+            double target_profit = 200;
+            int bperiod = 20;
+            double bdev = 1.3;
+
+            object[] inputs = {
+                initialQty,
+                spacing,
+                multiplier,
+                target_profit,
+                bperiod,
+                bdev
+
+            };
+
+            run_backtest(
+                false,
+                rows,
+                dtArr,
+                openArr,
+                highArr,
+                lowArr,
+                closeArr,
+                volArr,
+                inputs
+            );
+            
+            
+            /*
+            
+            int bperiod = 20;
+            double bdev = 1.3;
+            
+         //   for (int bperiod = 18; bperiod <= 25; bperiod += 2)
+              //  for (double bdev = 0.6; bdev <= 1.6; bdev += 0.2)
+                    for (double spacing = 0.0050; spacing <= 0.0200; spacing += 0.0020)
+                        for (double multiplier = 2; multiplier <= 5; multiplier += 1)
+                            for (double tp = 10; tp <= 200; tp += 2)
+                            {
+                                object[] inputs = {
+                                    0.05,       
+                                    spacing,
+                                    multiplier,
+                                    tp,
+                                    bperiod,
+                                    bdev
+                                };
+
+                                run_backtest(
+                                    true,
+                                    rows,
+                                    dtArr,
+                                    openArr,
+                                    highArr,
+                                    lowArr,
+                                    closeArr,
+                                    volArr,
+                                    inputs
+                                );
+                            }
+
+            */
+
+                    
+
+
+
+            Console.WriteLine("done");
+            Console.ReadLine();
+
+        }
+    }
+}
